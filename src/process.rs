@@ -1,21 +1,24 @@
 #![allow(unused)]
+use core::panic;
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::vec::Vec;
 use std::cmp::{Ord,Ordering};
+use std::ops::Drop;
 
 use sysinfo::{Process, ProcessStatus, Uid};
 
-#[derive(Clone)]
-struct ZProcess {
+#[derive(Clone,Debug)]
+pub struct ZProcess {
     // username: String,
-    pid: u32,
-    uid: u32,
-    cpu: f32,
-    memory: u64,
-    command: Vec<String>,
-    virt_mem: u64,
-    starttime: u64,
-    status: ProcessStatus,
+    pub pid: u32,
+    pub uid: u32,
+    pub cpu: f32,
+    pub memory: u64,
+    pub command: Vec<String>,
+    pub virt_mem: u64,
+    pub starttime: u64,
+    pub status: ProcessStatus,
 }
 
 impl ZProcess {
@@ -33,7 +36,7 @@ impl ZProcess {
     }
 
     // use for comparison within the Subtrees list
-    pub fn from_pid_as_zeroed(pid: &u32) -> Self {
+    pub const fn from_pid_as_zeroed(pid: &u32) -> Self {
         ZProcess {
             pid: *pid,
             uid: 0,
@@ -69,98 +72,157 @@ impl PartialOrd for ZProcess {
 }
 
 
-enum ZProcessNode {
-    ChildrenP {
-        children: HashMap<u64, ZProcess>,
+#[derive(Clone,Debug)]
+pub enum TreeNode {
+    WithChildren {
+        children: HashMap<u32, TreeNode>,
         node_val: ZProcess,
     },
-    ChildLessP {
+    WithoutChildren {
         node_val: ZProcess,
     }
 }
 
-use ZProcessNode::{ChildrenP,ChildLessP};
+use TreeNode::{WithChildren,WithoutChildren};
 
-impl ZProcessNode {
-    fn new_children(proc: ZProcess) -> Self {
-        ChildrenP {
+impl TreeNode {
+    pub fn new_with(proc: ZProcess, children: HashMap<u64,TreeNode>) -> Self {
+        WithChildren {
             children: HashMap::new(),
             node_val: proc,
-            // node_val: ZProcess::new(pid),
         } 
     }
+
+    pub const fn new_without(proc: ZProcess) -> Self {
+        WithoutChildren { node_val: proc }
+    }
+
+    pub fn node(&mut self) -> &mut ZProcess {
+        match self {
+            TreeNode::WithChildren { node_val, ..} => node_val,
+            TreeNode::WithoutChildren { node_val } => node_val,
+        }
+    }
+
+    pub fn children(&mut self) -> &mut HashMap<u32, TreeNode> {
+        match self {
+            TreeNode::WithChildren { children, ..} => children,
+            TreeNode::WithoutChildren { .. } => panic!("shite"),
+        }
+    }
+
+    fn has_children(&self) -> bool {
+        match self {
+            &TreeNode::WithoutChildren { .. } => false,
+            &TreeNode::WithChildren { .. } => true,
+        }
+    }
+
+    pub fn look_up_process_mut(
+        &mut self, 
+        target: &ZProcess) -> Option<&mut ZProcess> 
+    {
+        match self {
+            WithChildren {
+                children,
+                node_val,
+            } => {
+                if node_val == target {
+                    return Some(node_val);
+                }
+                for (k,v) in children.iter_mut() {
+                    if *k == target.pid {
+                        return Some(v.node());
+                    } else {
+                        if let TreeNode::WithoutChildren { .. } = *v {
+                            continue;
+                        } 
+                        match v.look_up_process_mut(target) {
+                            Some(found_node) => { return Some(found_node); },
+                            None => continue,
+                        }
+                    }
+                }
+                return None
+            },
+
+            WithoutChildren { 
+                node_val
+            } => {
+                if node_val == target { 
+                    return Some(self.node());
+                } else {
+                    return None
+                }
+            }
+        }
+    }
+
 }
 
-impl PartialEq for ZProcessNode {
+impl PartialEq for TreeNode {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (&ZProcessNode::ChildrenP {node_val: ref v1,..}, &ZProcessNode::ChildrenP {node_val: ref v2,..})  => v1 == v2, 
-            (&ZProcessNode::ChildLessP {node_val: ref v1}, &ZProcessNode::ChildLessP { node_val: ref v2}) => v1 == v2,
-            (&ZProcessNode::ChildrenP { node_val: ref v1,.. }, &ZProcessNode::ChildLessP { node_val: ref v2 }) 
-               | (&ZProcessNode::ChildLessP { node_val: ref v1 }, &ZProcessNode::ChildrenP { node_val: ref v2,..}) => v1 == v2,
+            (&WithChildren {node_val: ref v1,..}, &WithChildren {node_val: ref v2,..})  => v1 == v2, 
+            (&WithoutChildren {node_val: ref v1}, &WithoutChildren { node_val: ref v2}) => v1 == v2,
+            (&WithChildren { node_val: ref v1,.. }, &WithoutChildren { node_val: ref v2 }) 
+               | (&WithoutChildren { node_val: ref v1 }, &WithChildren { node_val: ref v2,..}) => v1 == v2,
         }
     }
 }
 
-impl Eq for ZProcessNode {}
+impl Eq for TreeNode {}
 
-impl Ord for ZProcessNode {
+impl Ord for TreeNode {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
-            (&ChildrenP {node_val: ref v1,..}, &ChildrenP {node_val: ref v2,..})  => v1.cmp(v2), 
-            (&ChildLessP {node_val: ref v1}, &ChildLessP { node_val: ref v2}) => v1.cmp(v2) ,
-            (&ChildrenP { node_val: ref v1,.. }, &ChildLessP { node_val: ref v2 }) 
-                | (&ChildLessP { node_val: ref v1 }, &ChildrenP { node_val: ref v2,..}) => v1.cmp(v2),
+            (&WithChildren {node_val: ref v1,..}, &WithChildren {node_val: ref v2,..})  => v1.cmp(v2), 
+            (&WithoutChildren {node_val: ref v1}, &WithoutChildren { node_val: ref v2}) => v1.cmp(v2) ,
+            (&WithChildren { node_val: ref v1,.. }, &WithoutChildren { node_val: ref v2 }) 
+                | (&WithoutChildren { node_val: ref v1 }, &WithChildren { node_val: ref v2,..}) => v1.cmp(v2),
         }
     }
 }
 
-impl PartialOrd for ZProcessNode {
+impl PartialOrd for TreeNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
+#[cfg(test)]
+mod tree_methods_testing {
+    use super::{TreeNode,ZProcess};
+    use std::collections::HashMap;
 
-/* the reason for this is that most subprocesses at least in linux systems
- * rarely exceed a depth of more than 3-5 so search is fairly fast
- * and the reason for storing subtrees in a list instead of just having a 
- * big tree is mainly for binary search so usually finding a process within 
- * a node will be O(log(n)+k) and finding a root node O(log(n))
- *  */
-struct ProcessSubtrees {
-    subtree_vec: Vec<ZProcessNode>,
+    #[test]
+    fn look_up_check() {
+        let mut tree = TreeNode::new_with(ZProcess::from_pid_as_zeroed(&1000), HashMap::new());
+
+        let children = tree.children();
+        children.insert(1002, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1002)});
+        children.insert(1003, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1003)});
+        children.insert(1004, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1004)}); 
+
+        let test_result = tree.look_up_process_mut(&ZProcess::from_pid_as_zeroed(&1004));
+
+        let proc_for_assert = ZProcess::from_pid_as_zeroed(&1004);
+        // assert_eq!(test_result, Some(TreeNode::WithoutChildren { node_val: proc_for_assert}));
+    }
+
+    #[test]
+    fn test_mut() {
+        let mut tree = TreeNode::new_with(ZProcess::from_pid_as_zeroed(&1000), HashMap::new());
+
+        let children = tree.children();
+        children.insert(1002, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1002)});
+        children.insert(1003, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1003)});
+        children.insert(1004, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1004)}); 
+
+        let mut proc = tree.look_up_process_mut(&ZProcess::from_pid_as_zeroed(&1002)).unwrap();
+        proc.memory = 50000;
+        drop(proc);
+
+        assert_eq!(50000 as u64, tree.look_up_process_mut(&ZProcess::from_pid_as_zeroed(&1002)).unwrap().memory);
+    }
 }
-
-impl ProcessSubtrees {
-    fn new() -> Self{
-        ProcessSubtrees {
-            subtree_vec: vec![]
-        }
-    }
-
-    fn find_root_sorted(&self, search_pid: &u32) -> Option<&ZProcessNode>{
-        let temp_node = ZProcessNode::ChildLessP { 
-            node_val: ZProcess::from_pid_as_zeroed(search_pid)
-        };
-
-        match self.subtree_vec.binary_search_by(|idx| idx.cmp(&temp_node)) {
-            Ok(found_index) => { Some(&self.subtree_vec[found_index]) },
-            Err(_) => { return None },
-        }
-    }
-
-    fn find_subnode(search_pid: &u32) {
-        let temp_node = ZProcessNode::ChildLessP { 
-            node_val: ZProcess::from_pid_as_zeroed(search_pid) 
-        };
-
-        for 
-    }
-
-    fn pop_subtree() {
-
-    }
-
-
-} 
