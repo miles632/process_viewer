@@ -104,10 +104,10 @@ impl TreeNode {
         }
     }
 
-    pub fn children(&mut self) -> &mut HashMap<u32, TreeNode> {
+    pub fn children(&mut self) -> Option<&mut HashMap<u32, TreeNode>> {
         match self {
-            TreeNode::WithChildren { children, ..} => children,
-            TreeNode::WithoutChildren { .. } => panic!("shite"),
+            TreeNode::WithChildren { children, ..} => Some(children),
+            TreeNode::WithoutChildren { .. } => None,
         }
     }
 
@@ -118,7 +118,19 @@ impl TreeNode {
         }
     }
 
-    pub fn look_up_process_mut(
+    fn insert(&mut self, mut node: TreeNode, parent: Option<&ZProcess>) {
+        match parent {
+            Some(proc) => {
+                self.look_up_children(proc).unwrap().insert(node.node().pid, node);
+            }
+
+            None => {
+                self.children().unwrap().insert(node.node().pid, node);
+            }
+        }
+    }
+
+    pub fn look_up_process(
         &mut self, 
         target: &ZProcess) -> Option<&mut ZProcess> 
     {
@@ -137,7 +149,7 @@ impl TreeNode {
                         if let TreeNode::WithoutChildren { .. } = *v {
                             continue;
                         } 
-                        match v.look_up_process_mut(target) {
+                        match v.look_up_process(target) {
                             Some(found_node) => { return Some(found_node); },
                             None => continue,
                         }
@@ -152,6 +164,32 @@ impl TreeNode {
                 if node_val == target { 
                     return Some(self.node());
                 } else {
+                    return None
+                }
+            }
+        }
+    }
+
+    fn look_up_children(
+        &mut self,
+        target: &ZProcess ) -> Option<&mut HashMap<u32, TreeNode>> 
+    {
+        match self {
+            WithoutChildren { .. } => None,
+
+            WithChildren { children, node_val} => {
+                if node_val == target {
+                    Some(children)
+                } else {
+                    for (k,v) in children.iter_mut().filter(|(k,v)| v.has_children()) {
+                        if *k == target.pid {
+                            return Some(v.children().unwrap())
+                        }
+                        if let Some(found_target) = v.look_up_children(target) {
+                            return Some(found_target);
+                        } 
+                        continue;
+                    } 
                     return None
                 }
             }
@@ -199,12 +237,12 @@ mod tree_methods_testing {
     fn look_up_check() {
         let mut tree = TreeNode::new_with(ZProcess::from_pid_as_zeroed(&1000), HashMap::new());
 
-        let children = tree.children();
+        let children = tree.children().unwrap();
         children.insert(1002, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1002)});
         children.insert(1003, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1003)});
         children.insert(1004, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1004)}); 
 
-        let test_result = tree.look_up_process_mut(&ZProcess::from_pid_as_zeroed(&1004));
+        let test_result = tree.look_up_process(&ZProcess::from_pid_as_zeroed(&1004));
 
         let proc_for_assert = ZProcess::from_pid_as_zeroed(&1004);
         // assert_eq!(test_result, Some(TreeNode::WithoutChildren { node_val: proc_for_assert}));
@@ -214,15 +252,22 @@ mod tree_methods_testing {
     fn test_mut() {
         let mut tree = TreeNode::new_with(ZProcess::from_pid_as_zeroed(&1000), HashMap::new());
 
-        let children = tree.children();
+        let children = tree.children().unwrap();
         children.insert(1002, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1002)});
         children.insert(1003, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1003)});
         children.insert(1004, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1004)}); 
 
-        let mut proc = tree.look_up_process_mut(&ZProcess::from_pid_as_zeroed(&1002)).unwrap();
+        let mut proc = tree.look_up_process(&ZProcess::from_pid_as_zeroed(&1002)).unwrap();
         proc.memory = 50000;
         drop(proc);
 
-        assert_eq!(50000 as u64, tree.look_up_process_mut(&ZProcess::from_pid_as_zeroed(&1002)).unwrap().memory);
+        assert_eq!(50000 as u64, tree.look_up_process(&ZProcess::from_pid_as_zeroed(&1002)).unwrap().memory);
     }
+
+    // #[test]
+    // fn look_up_children() {
+    //     let mut tree = TreeNode::new_with(ZProcess::from_pid_as_zeroed(&1000), HashMap::new());
+    //     let children = tree.children().unwrap();
+    //     children.insert(1002, )
+    // }
 }
