@@ -21,8 +21,18 @@ fn main() -> Result<(), eframe::Error>{
         ZProcess::new(sys_proc)
     }).collect::<Vec<ZProcess>>();
     zprocesses.sort();
+    let zprocesses2:Vec<ZProcess> = zprocesses.into_iter().take(100).collect();
 
-    tree_init(zprocesses);
+    // tree_init(zprocesses);
+    let options = NativeOptions {
+        ..Default::default()
+    };
+    let app_handle = EguiApp::default();
+    eframe::run_native(
+        "Process Viewer",
+        options,
+        Box::new(|cc| Box::new(EguiApp::new(cc, zprocesses2))),
+    );
 
     Ok(())
 }
