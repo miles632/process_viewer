@@ -63,6 +63,14 @@ impl ZProcess {
             status: ProcessStatus::Dead,
         }
     }
+
+    fn proc_refresh(&mut self, sys: &mut System) -> Option<Self> {
+        sysinfo::System::refresh_process(sys, sysinfo::Pid::from_u32(self.pid));
+        match sys.process(sysinfo::Pid::from_u32(self.pid)) {
+            Some(proc) => Some(ZProcess::new(proc)),
+            None => None,
+        }
+    }
 }
 
 // ordering implementations boilerplate because derive kinda sucks
@@ -209,6 +217,17 @@ impl TreeNode{
                 }
             }
         }
+    }
+
+    fn step_through_and_update(&mut self) {
+        use sysinfo::ProcessStatus::*;
+
+        for (pid,proc_node)in self.children().unwrap().into_iter() {
+            if proc_node.node().status != Run { continue; }
+
+        }
+
+            
     }
 
 }
