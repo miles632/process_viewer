@@ -1,12 +1,17 @@
 #![allow(unused)]
 use core::panic;
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
+use std::thread;
 use std::vec::Vec;
 use std::cmp::{Ord,Ordering};
 use std::ops::Drop;
+use std::boxed::Box;
 
-use sysinfo::{Process, ProcessStatus, Uid};
+use egui::accesskit::Tree;
+use sysinfo::{Process, Uid, System};
+use sysinfo::ProcessStatus;
+use sysinfo::ProcessStatus::*;
 
 #[derive(Clone,Debug)]
 pub struct ZProcess {
@@ -60,13 +65,13 @@ impl ZProcess {
             command: vec![],
             virt_mem: 0,
             starttime: 0,
-            status: ProcessStatus::Dead,
+            status: Dead,
         }
     }
 
-    fn proc_refresh(&mut self, sys: &mut System) -> Option<Self> {
-        sysinfo::System::refresh_process(sys, sysinfo::Pid::from_u32(self.pid));
-        match sys.process(sysinfo::Pid::from_u32(self.pid)) {
+    fn proc_refresh(&mut self, sys_handle: &mut System) -> Option<Self> {
+        sysinfo::System::refresh_process(sys_handle, sysinfo::Pid::from_u32(self.pid));
+        match sys_handle.process(sysinfo::Pid::from_u32(self.pid)) {
             Some(proc) => Some(ZProcess::new(proc)),
             None => None,
         }
@@ -94,222 +99,186 @@ impl PartialOrd for ZProcess {
     }
 }
 
-
+type ProcMap = HashMap<u32, TreeNode>;
 #[derive(Clone,Debug)]
-pub enum TreeNode {
-    WithChildren {
-        children: HashMap<u32, TreeNode>,
-        node_val: ZProcess,
-    },
-    WithoutChildren {
-        node_val: ZProcess,
-    }
+pub struct TreeNode {
+    pub val: ZProcess,
+    pub child_procs: ProcMap,
 }
 
-use TreeNode::{WithChildren,WithoutChildren};
-
-impl TreeNode{
-    pub fn new_with(proc: ZProcess, children: HashMap<u64,TreeNode>) -> Self {
-        WithChildren {
-            children: HashMap::new(),
-            node_val: proc,
-        } 
-    }
-
-    pub const fn new_without(proc: ZProcess) -> Self {
-        WithoutChildren { node_val: proc }
-    }
-
-    pub fn node(&mut self) -> &mut ZProcess {
-        match self {
-            TreeNode::WithChildren { node_val, ..} => node_val,
-            TreeNode::WithoutChildren { node_val } => node_val,
+impl TreeNode {
+    pub fn new(proc: ZProcess, children: ProcMap) -> Self {
+        TreeNode {
+            val: proc, 
+            child_procs: children,
         }
     }
 
-    pub fn children(&mut self) -> Option<&mut HashMap<u32, TreeNode>> {
-        match self {
-            TreeNode::WithChildren { children, ..} => Some(children),
-            TreeNode::WithoutChildren { .. } => None,
-        }
-    }
-
-    fn has_children(&self) -> bool {
-        match self {
-            &TreeNode::WithoutChildren { .. } => false,
-            &TreeNode::WithChildren { .. } => true,
-        }
-    }
-
-    fn insert(&mut self, mut node: TreeNode, parent: Option<&ZProcess>) {
+    pub fn insert(
+        &mut self, 
+        mut node: TreeNode, 
+        parent: Option<&ZProcess>
+    ) 
+    {
         match parent {
             Some(proc) => {
-                self.look_up_children(proc).unwrap().insert(node.node().pid, node);
+                // self.look_up_children(proc).unwrap().insert(node.val.pid, node);
+                self.look_up_children(proc).expect("god damnit").insert(node.val.pid, node);
             }
 
             None => {
-                self.children().unwrap().insert(node.node().pid, node);
+                self.child_procs.insert(node.val.pid, node);
             }
         }
     }
 
     pub fn look_up_process(
         &mut self, 
-        target: &ZProcess) -> Option<&mut ZProcess> 
+        target: &ZProcess
+    ) -> Option<&mut ZProcess> 
     {
-        match self {
-            WithChildren {
-                children,
-                node_val,
-            } => {
-                if node_val == target {
-                    return Some(node_val);
-                }
-                for (k,v) in children.iter_mut() {
-                    if *k == target.pid {
-                        return Some(v.node());
-                    } else {
-                        if let TreeNode::WithoutChildren { .. } = *v {
-                            continue;
-                        } 
-                        match v.look_up_process(target) {
-                            Some(found_node) => { return Some(found_node); },
-                            None => continue,
-                        }
+        if self.val == *target {
+            return Some(&mut self.val);
+        }
+
+        for (_,proc) in self.child_procs.iter_mut() {
+            return proc.look_up_process(target)
+        }
+
+        None
+    }
+
+    
+    pub fn look_up_children(
+        &mut self, 
+        target: &ZProcess,
+    ) -> Option<&mut ProcMap> {
+        if self.val == *target {
+            return Some(&mut self.child_procs);
+        }
+
+        for (_, proc) in self.child_procs.iter_mut() {
+            return proc.look_up_children(target)
+        }
+
+        None
+    }
+
+    pub fn step_through_and_update(
+        &mut self, 
+        sys_handle: &mut System
+    ) {
+        // update root
+
+        self.val.proc_refresh(sys_handle); 
+
+        if !self.child_procs.is_empty() {
+            for (_, proc) in self.child_procs
+                .iter_mut()
+                .filter(|(_,proc)| {
+                    match proc.val.status {
+                        Zombie|Dead|Sleep|UninterruptibleDiskSleep => false,
+                        _ => true,
                     }
-                }
-                return None
-            },
-
-            WithoutChildren { 
-                node_val
-            } => {
-                if node_val == target { 
-                    return Some(self.node());
-                } else {
-                    return None
-                }
+                }) {
+                    proc.step_through_and_update(sys_handle);
             }
         }
     }
 
-    fn look_up_children(
+    pub fn pop_zombie_procs(
+        &mut self, 
+        sys: &mut System
+    ) {
+        self.child_procs.retain(|_, proc| {
+            proc.val.status != Zombie
+            ||
+            proc.val.status != Dead
+        });
+
+        for (_, proc) in self.child_procs.iter_mut() {
+            proc.pop_zombie_procs(sys);
+        }
+    }
+
+    #[warn(unused)]
+    pub fn push_new_procs(
         &mut self,
-        target: &ZProcess ) -> Option<&mut HashMap<u32, TreeNode>> 
-    {
-        match self {
-            WithoutChildren { .. } => None,
+        sys: &mut System,
+        proc_vec: &Vec<ZProcess>
+    ) {
+        let new_proc_vec = sys.processes().into_iter().map(|(_,proc)|{
+            ZProcess::new(proc)
+        }).collect::<Vec<ZProcess>>();
 
-            WithChildren { children, node_val} => {
-                if node_val == target {
-                    Some(children)
-                } else {
-                    for (k,v) in children.iter_mut().filter(|(k,v)| v.has_children()) {
-                        if *k == target.pid {
-                            return Some(v.children().unwrap())
-                        }
-                        if let Some(found_target) = v.look_up_children(target) {
-                            return Some(found_target);
-                        } 
-                        continue;
-                    } 
-                    return None
-                }
+        let mut procs_to_be_appended = Vec::new();
+
+        for proc in new_proc_vec.into_iter().filter(|proc| proc.status == Zombie) { 
+            if !proc_vec.contains(&proc) {
+                procs_to_be_appended.push(proc)
             }
+        }
+
+        let mut procs_to_be_appended = procs_to_be_appended.into_iter().map(|proc|{
+            TreeNode::new(proc, HashMap::new())
+        }).collect::<Vec<TreeNode>>();
+
+
+        let mut procs_wo_parents = procs_to_be_appended.clone();
+
+        procs_wo_parents.retain(|proc|{
+            !procs_to_be_appended.contains(&TreeNode::new(
+                ZProcess::from_pid_as_zeroed(&proc.val.ppid.unwrap()),
+                HashMap::new()
+            ))
+        });
+
+        for mut proc in procs_wo_parents.into_iter() {
+            for subproc in procs_to_be_appended.iter_mut().filter(|subproc| subproc.val.ppid.unwrap() != proc.val.pid) {
+                proc.child_procs.insert(subproc.val.pid, subproc.to_owned());
+            }
+            match self.look_up_children(&ZProcess::from_pid_as_zeroed(&proc.val.ppid.unwrap())) {
+                Some(children) => {
+                    children.insert(proc.val.pid, proc)
+                },
+                None => {
+                    self.child_procs.insert(proc.val.pid, proc)
+                },
+            };
         }
     }
 
-    fn step_through_and_update(&mut self) {
-        use sysinfo::ProcessStatus::*;
+    pub fn flatten_tree_into_list(self, list: &mut Vec<ZProcess>) {
+        list.push(self.val);
 
-        for (pid,proc_node)in self.children().unwrap().into_iter() {
-            if proc_node.node().status != Run { continue; }
-
+        for (_, proc) in self.child_procs.into_iter() {
+            proc.flatten_tree_into_list(list)
         }
-
-            
     }
 
 }
 
 impl PartialEq for TreeNode {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (&WithChildren {node_val: ref v1,..}, &WithChildren {node_val: ref v2,..})  => v1 == v2, 
-            (&WithoutChildren {node_val: ref v1}, &WithoutChildren { node_val: ref v2}) => v1 == v2,
-            (&WithChildren { node_val: ref v1,.. }, &WithoutChildren { node_val: ref v2 }) 
-               | (&WithoutChildren { node_val: ref v1 }, &WithChildren { node_val: ref v2,..}) => v1 == v2,
-        }
+        self.val == other.val
     }
 }
 
-impl Eq for TreeNode{}
+impl Eq for TreeNode {}
 
 impl Ord for TreeNode {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (self, other) {
-            (&WithChildren {node_val: ref v1,..}, &WithChildren {node_val: ref v2,..})  => v1.cmp(v2), 
-            (&WithoutChildren {node_val: ref v1}, &WithoutChildren { node_val: ref v2}) => v1.cmp(v2) ,
-            (&WithChildren { node_val: ref v1,.. }, &WithoutChildren { node_val: ref v2 }) 
-                | (&WithoutChildren { node_val: ref v1 }, &WithChildren { node_val: ref v2,..}) => v1.cmp(v2),
-        }
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.val.cmp(&other.val)
     }
 }
 
 impl PartialOrd for TreeNode {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match self.val.partial_cmp(&other.val) {
+            Some(core::cmp::Ordering::Equal) => {
+                return Some(Ordering::Equal)
+            }
+            ord => return ord,
+        }
     }
-}
-
-#[cfg(test)]
-mod tree_methods_testing {
-    use crate::_find_children;
-
-    use super::{TreeNode,ZProcess};
-    use std::collections::HashMap;
-    use sysinfo::System;
-
-    #[test]
-    fn look_up_check() {
-        let mut tree = TreeNode::new_with(ZProcess::from_pid_as_zeroed(&1000), HashMap::new());
-
-        let children = tree.children().unwrap();
-        children.insert(1002, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1002)});
-        children.insert(1003, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1003)});
-        children.insert(1004, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1004)}); 
-
-        let test_result = tree.look_up_process(&ZProcess::from_pid_as_zeroed(&1004));
-
-        let proc_for_assert = ZProcess::from_pid_as_zeroed(&1004);
-        // assert_eq!(test_result, Some(TreeNode::WithoutChildren { node_val: proc_for_assert}));
-    }
-
-    #[test]
-    fn test_mut() {
-        let mut tree = TreeNode::new_with(ZProcess::from_pid_as_zeroed(&1000), HashMap::new());
-
-        let children = tree.children().unwrap();
-        children.insert(1002, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1002)});
-        children.insert(1003, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1003)});
-        children.insert(1004, TreeNode::WithoutChildren { node_val: ZProcess::from_pid_as_zeroed(&1004)}); 
-
-        let mut proc = tree.look_up_process(&ZProcess::from_pid_as_zeroed(&1002)).unwrap();
-        proc.memory = 50000;
-        drop(proc);
-
-        assert_eq!(50000 as u64, tree.look_up_process(&ZProcess::from_pid_as_zeroed(&1002)).unwrap().memory);
-    }
-
-    #[test]
-    fn child_idx() {
-        let mut sys_handle = sysinfo::System::new_all();
-        let mut zprocesses = sys_handle.processes().into_iter().map(|(_,sys_proc)|{
-            ZProcess::new(sys_proc)
-        }).collect::<Vec<ZProcess>>();
-        let vec = _find_children(&mut ZProcess::from_pid_as_zeroed(&1), &zprocesses).unwrap();
-        assert!(vec.len()!=0);
-        // assert!(vec.len()>50);
-    }
-
 }
